@@ -987,6 +987,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="soft_rate" placeholder="600s"></label>
               <label class="fld"><span class="lb">软冷却退避上限</span>
                 <input name="soft_rate_max" placeholder="2h"></label>
+              <label class="fld"><span class="lb">软限流冻结门槛</span>
+                <input name="soft_rate_strikes" type="number" min="1" placeholder="3">
+                <span class="hint">连续 N 次 429 / WAF / 6004 才冻结；1 = 一次即冻结</span></label>
               <label class="fld"><span class="lb">熔断基础时长</span>
                 <input name="breaker_cooldown" placeholder="30m"></label>
             </div>

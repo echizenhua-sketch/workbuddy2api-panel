@@ -77,6 +77,10 @@ type Status struct {
 	Until                    time.Time `json:"until,omitempty"`
 	Reason                   string    `json:"reason,omitempty"`
 	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	// SoftRateFails 连续软限流计数（429 / WAF 403 / 6004 共用），冻结门槛进度：
+	// 达 soft_rate_strikes（默认 3）才写冷却，故本值 >0 且未 cooling = 「已攒 N 次、还没冻结」。
+	// 零值也透出（运维口径同 consecutive_fails：缺失会让人误以为"没记录"）。
+	SoftRateFails            int       `json:"soft_rate_fails"`
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -223,6 +227,14 @@ type entry struct {
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
+	// softRateFails 连续软限流事件计数（429 / WAF 403 / 6004 共用一个计数），
+	// 达到 softRateStrikes（默认 3）才真正写入冷却——「不要一有 429 就冻结」。
+	// 与 softStreak 的分工：softRateFails 是「还没冻结前攒了几次」的进度计数，
+	// 达阈即清零并交给 softStreak 推进退避指数；两者不可混用，否则冷却时长会翻倍。
+	// 清零点（账号被证明恢复或人工干预）：NoteSuccess、Revive、Disable（清冷却域）。
+	// 持久化（stateAccount.SoftRateFails）：与 sessionDeadFails 同口径——上游持续
+	// 限流时重启归零会让门槛重学，且清零点同样落盘，重启后不残留旧计数。
+	softRateFails int
 	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
 	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
 	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
@@ -439,6 +451,9 @@ type stateAccount struct {
 	// 运行态计数（soft_streak/session_dead_fails/credits_expiring）不用 omitempty：
 	// 零值缺失会让人误以为"没记录"，实际是零值被省略。
 	SoftStreak int `json:"soft_streak"`
+	// SoftRateFails 连续软限流事件计数（冻结门槛进度，见 entry.softRateFails）。
+	// 持久化以保留「重启后连续计数继续累计」。
+	SoftRateFails int `json:"soft_rate_fails"`
 	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
 	// 「重启后连续计数继续累计」。
 	SessionDeadFails int `json:"session_dead_fails"`
@@ -508,6 +523,12 @@ const (
 // defaultSoftRateMax 软冷却指数退避的默认封顶：softRateMax 未注入（<=0）时按此值算，
 // 避免测试/裸用池时退避无上限。
 const defaultSoftRateMax = 2 * time.Hour
+
+// defaultSoftRateStrikes 连续软限流事件达到该次数才真正写入冷却（soft_rate_strikes）。
+// 取 3：单次 429 常是上游瞬时频控（尤其共享出口 IP 场景下多号同秒齐发），
+// 一次即冻结会让健康账号被反复踢出池子（表现为面板「动不动就冻结」且客户端秒失败）。
+// 连续 3 次说明限流是持续的，此时冻结才是正确处置。0/负值回落本值。
+const defaultSoftRateStrikes = 3
 
 // defaultDegrade* 连败降权默认参数（issue #114）：连败 5 次临时出池 10 分钟。
 const (

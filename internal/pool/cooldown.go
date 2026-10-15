@@ -150,31 +150,57 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		now := time.Now()
-		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
-			if e.modelCooldowns == nil {
-				e.modelCooldowns = map[string]modelCooldown{}
-			}
-			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
-				ResetAt: resetAt,
-				Reason:  reason,
-			}
-		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
-			if e.coolKind != CoolSoft || !now.Before(e.until) {
-				d := p.softDurationLocked(base, e.softStreak+1)
-				e.softStreak++
-				e.until = now.Add(d)
-			}
-			e.coolKind = CoolSoft
-			e.reason = reason
-			clearRoutingModelCooldownsLocked(e)
-		}
-		p.dirty.Store(true)
+		p.cooldownSoftForModelLocked(e, time.Now(), base, resetAt, model, reason)
 	}
+}
+
+// cooldownSoftForModelLocked 模型级软冷却的实际写入。调用方必须已持有 p.mu，
+// 且已通过「冻结门槛 + 兜底探测守卫」（见 NoteSoftRateForModel）。
+func (p *Pool) cooldownSoftForModelLocked(e *entry, now time.Time, base time.Duration, resetAt time.Time, model, reason string) {
+	if !resetAt.IsZero() {
+		// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+		if e.modelCooldowns == nil {
+			e.modelCooldowns = map[string]modelCooldown{}
+		}
+		e.modelCooldowns[model] = modelCooldown{
+			Until:   p.cappedSoftUntilLocked(now, resetAt),
+			ResetAt: resetAt,
+			Reason:  reason,
+		}
+	} else {
+		// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
+		// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
+		if e.coolKind != CoolSoft || !now.Before(e.until) {
+			d := p.softDurationLocked(base, e.softStreak+1)
+			e.softStreak++
+			e.until = now.Add(d)
+		}
+		e.coolKind = CoolSoft
+		e.reason = reason
+		clearRoutingModelCooldownsLocked(e)
+	}
+	p.dirty.Store(true)
+}
+
+// NoteSoftRateForModel 模型级 6004 软限流的**策略入口**（handler.applyErrorPolicy 调用）。
+// 与 NoteSoftRate 同构（同一套连续计数与兜底探测守卫），只是落点换成模型级台账。
+// 返回 true 表示本次已写入模型级冷却。
+func (p *Pool) NoteSoftRateForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	if resetAt.IsZero() && e.coolKind == CoolSoft && now.Before(e.until) {
+		return false // 兜底探测：不写冷却、不消耗计数（原有语义）
+	}
+	if !p.strikeSoftRateLocked(e) {
+		return false // 未达冻结门槛：只计数
+	}
+	p.cooldownSoftForModelLocked(e, now, base, resetAt, model, reason)
+	return true
 }
 
 // RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
@@ -375,20 +401,56 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		now := time.Now()
-		if !resetAt.IsZero() {
-			e.until = p.cappedSoftUntilLocked(now, resetAt)
-		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
-			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
-			d := p.softDurationLocked(base, e.softStreak+1)
-			e.softStreak++
-			e.until = now.Add(d)
-		}
-		e.coolKind = CoolSoft
-		e.reason = reason
-		clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
-		p.dirty.Store(true)
+		p.cooldownSoftRateLocked(e, time.Now(), base, resetAt, reason)
 	}
+}
+
+// cooldownSoftRateLocked 账号级软冷却的实际写入。调用方必须已持有 p.mu，
+// 且已通过「冻结门槛 + 兜底探测守卫」（见 NoteSoftRate）。
+func (p *Pool) cooldownSoftRateLocked(e *entry, now time.Time, base time.Duration, resetAt time.Time, reason string) {
+	if !resetAt.IsZero() {
+		e.until = p.cappedSoftUntilLocked(now, resetAt)
+	} else if e.coolKind != CoolSoft || !now.Before(e.until) {
+		// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
+		d := p.softDurationLocked(base, e.softStreak+1)
+		e.softStreak++
+		e.until = now.Add(d)
+	}
+	e.coolKind = CoolSoft
+	e.reason = reason
+	clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
+	p.dirty.Store(true)
+}
+
+// NoteSoftRate 429 / WAF 403 软限流的**策略入口**（handler.applyErrorPolicy 调用）：
+// 单次限流不冻结账号，连续 softRateStrikes（默认 3）次才真正写入冷却。与
+// NoteSessionDead（连续 3 次 12153 才禁用）同构——一次失败常是上游瞬时频控
+// （共享出口 IP 场景下多号同秒齐发），一次即冻结会让健康账号被反复踢出池子，
+// 表现为面板「动不动就冻结」+ 客户端秒失败 503。
+//
+// 守卫顺序（两条都必须保留）：
+//  1. 兜底探测：无 resetAt 且已在有效软冷却中 → 不写冷却、**也不消耗计数**。
+//     否则兜底探测会把计数刷满并重写冷却，重新引入「越用越冷」的正反馈。
+//  2. 连续门槛：未达阈值只计数（落盘）并返回 false，账号保持可选。
+//
+// 计数清零点：NoteSuccess（成功证明限流已解除）、Revive（人工解冻）、
+// disableLocked/clearCoolingLocked（禁用是更强的终态）。返回 true 表示本次已写冷却。
+func (p *Pool) NoteSoftRate(uid string, base time.Duration, resetAt time.Time, reason string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	if resetAt.IsZero() && e.coolKind == CoolSoft && now.Before(e.until) {
+		return false // 兜底探测：不写冷却、不消耗计数（原有语义）
+	}
+	if !p.strikeSoftRateLocked(e) {
+		return false // 未达冻结门槛：只计数
+	}
+	p.cooldownSoftRateLocked(e, now, base, resetAt, reason)
+	return true
 }
 
 // cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt

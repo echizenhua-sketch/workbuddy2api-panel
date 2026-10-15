@@ -28,14 +28,15 @@ package pool
 
 import "time"
 
-// clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
-// reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// clearCoolingLocked 清冷却域：until/coolKind/softStreak/softRateFails/modelCooldowns
+// 全归零，reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
 // 调用方必须已持有 p.mu。
 func (e *entry) clearCoolingLocked() {
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
+	e.softRateFails = 0    // 冻结门槛进度同属冷却域，清零（禁用是更强的终态，进度无意义）
 	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
 }
 

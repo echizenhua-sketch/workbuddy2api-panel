@@ -239,6 +239,9 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
 		// （运维口径：缺失会让人误以为没记录）。
 		"credit_floor": h.cfg.Pool.CreditFloor(),
+		// soft_rate_strikes 生效的连续软限流冻结门槛（默认 3）。与
+		// accounts[].soft_rate_fails 对照即可读出「还差几次就冻结」；1 = 一次即冻结。
+		"soft_rate_strikes": h.cfg.Pool.SoftRateStrikes(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -1339,21 +1342,23 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrSoftRate:
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
 		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		//   - 模型级（6004）→ NoteSoftRateForModel：写 modelCooldowns[model]，切模型豁免。
+		//   - 账号级（非 6004）→ NoteSoftRate：写账号级 until，不产生模型豁免。
+		// 两者都走「连续 soft_rate_strikes（默认 3）次才真正冷却」的策略入口：
+		// 单次 429 不冻结账号（账号留在池中、面板不显示「冻结」），连续达阈才冷却。
 		modelRateLimited := upstream.IsModelRateLimit(body)
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if modelRateLimited {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
+				h.cfg.Pool.NoteSoftRateForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+			h.cfg.Pool.NoteSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 			return
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
 		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 		if uerr != nil && uerr.RetryAfter > 0 {
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+			h.cfg.Pool.NoteSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
 			if modelRateLimited {
 				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 			}
@@ -1362,20 +1367,21 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 		// （热改优先），管理面板改 soft_rate 后立即生效。
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
+		h.cfg.Pool.NoteSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 		if modelRateLimited {
 			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 		}
 	case upstream.ErrWafBlock:
-		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
+		// WAF 403（无业务信封拦截形态）。软冷却复用 NoteSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶
-		// soft_rate_max、冷却中兜底探测不翻倍——全部继承既有语义。
-		// Retry-After 头优先（WAF 拦截页可能带该头）。不 Disable。
+		// soft_rate_max、冷却中兜底探测不翻倍——全部继承既有语义，并同样受
+		// soft_rate_strikes 连续门槛约束。IP 级 fail-fast（h.wafIP.noteWaf）不受
+		// 影响，仍在轮转循环里独立止损。不 Disable。
 		if uerr != nil && uerr.RetryAfter > 0 {
-			h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Now().Add(uerr.RetryAfter), "waf 403 block (retry-after)")
+			h.cfg.Pool.NoteSoftRate(uid, jitterDur(wafCooldownBase), time.Now().Add(uerr.RetryAfter), "waf 403 block (retry-after)")
 			return
 		}
-		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
+		h.cfg.Pool.NoteSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:

@@ -367,7 +367,10 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
-function renderAccounts(list) {
+function renderAccounts(list, strikes) {
+  // 连续软限流冻结门槛（overview.soft_rate_strikes，默认 3）：用于把 soft_rate_fails
+  // 渲染成「限流 2/3」。后端未透出时回落 3，与 pool.defaultSoftRateStrikes 同口径。
+  const maxStrikes = strikes > 0 ? strikes : 3;
   const tb = $('accBody');
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
@@ -389,6 +392,13 @@ function renderAccounts(list) {
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    // 冻结门槛进度（soft_rate_fails）：仅在「未禁用/未暂停/未冷却」时展示——
+    // 冷却中该计数恒为 0（兜底探测不消耗计数），此时 note 已显示 reason，无需重复。
+    // 用途：运维不必翻 state.json 就能看出「这个号已攒 2 次 429，再来一次就冻结」。
+    const strikeNote = (!s.disabled && !s.paused && !(cool > 0) && (s.soft_rate_fails || 0) > 0)
+      ? '<div class="hint" style="font-size:11.5px;color:var(--warn);margin-top:3px">限流计数 ' +
+        s.soft_rate_fails + '/' + maxStrikes + '（连续达阈才冻结）</div>'
+      : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
@@ -424,7 +434,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + note + strikeNote + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -512,7 +522,7 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
-    renderAccounts(d.accounts || []);
+    renderAccounts(d.accounts || [], d.soft_rate_strikes);
     renderModelLocks(d.model_locks);
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
     // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
@@ -982,6 +992,7 @@ const CFG_MAP = {
   credit_floor: ['pool', 'credit_floor'],
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
+  soft_rate_strikes: ['cooldown', 'soft_rate_strikes'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
   ttl: ['session_sticky', 'ttl'],
@@ -2869,9 +2880,16 @@ function renderExpirySnapshot(d) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const keyed = list.map(a => {
     // 后端给的是 RFC3339 带时区；无到期信息（长期包/未刷新）的账号排在最后。
+    //
+    // 注意 credits_earliest_expiry 在 Go 侧是非指针 time.Time + omitempty，而 omitempty
+    // 对 struct 无效：无到期信息时既不省略、也不是 null，而是零值串
+    // "0001-01-01T00:00:00Z"。它 truthy 且能解析成一个极小的时间戳，照单全收就会被当成
+    // 有效排序键而排到最前，与这里「排在最后」的意图正好相反 —— 故与无法解析的值一并
+    // 归为「无到期信息」。
     let key = null, ms = 0;
-    if (a.credits_earliest_expiry) {
-      const t = new Date(a.credits_earliest_expiry);
+    const raw = a.credits_earliest_expiry;
+    if (raw && String(raw).slice(0, 10) !== '0001-01-01') {
+      const t = new Date(raw);
       if (!isNaN(t.getTime())) { ms = t.getTime(); key = ms; }
     }
     return { a, key, ms };
@@ -2889,12 +2907,20 @@ function renderExpirySnapshot(d) {
         '<span class="exp-nm">' + nm + '</span>' +
         '<span class="exp-main">无近期到期批次</span></div>';
     }
-    const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
+    // 到期日与剩余天数一律按本地墙钟的日期算，与明细路径 expDaysLeft 同口径。
+    // 两者都不能直接用瞬时值：
+    //   - toISOString() 给的是 UTC 日期，本地 08:00 前到期的批次会显示成前一天；
+    //   - ceil((ms - today)/86400000) 会把带时分秒的到期时刻多算一天（线上批次实测都带
+    //     时分秒，如 2026-10-16T10:11:23+08:00 会被算成「2 天后」，按日期其实是「明天
+    //     到期」），于是同一张卡片上日期与「N 天后」自相矛盾，也与明细视图打架。
+    const wd = new Date(ms);
+    const when = wd.getFullYear() + '-' + String(wd.getMonth() + 1).padStart(2, '0') + '-' +
+      String(wd.getDate()).padStart(2, '0');
+    const days = Math.max(0, Math.round((new Date(when + 'T00:00:00') - today.getTime()) / 86400000));
     const remain = Number(a.credits_earliest_remaining || 0);
     const daily = Math.ceil(remain / Math.max(1, days));
     const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    const when = new Date(ms).toISOString().slice(0, 10);
     return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
       '<span class="exp-nm">' + nm + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +

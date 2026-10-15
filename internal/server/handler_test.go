@@ -362,6 +362,10 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	// 让 bad 积分更高被先选中（与 TestChatRotatesOnHardCredit 同一确定性手法）。
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
+	// 本用例只验证「429/限流文案 → 冷却落盘 + 冷却期不再被选中」，不验证冻结门槛，
+	// 故把门槛压到 1（一次即冷却）。门槛本身由 TestApplyErrorPolicySoftRateExponentialBackoff
+	// 与 pool.TestSoftRateStrikesGate 覆盖。
+	p.SetSoftRateStrikes(1)
 	const soft = 45 * time.Second
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
 
@@ -398,16 +402,41 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	// 吸收上游语义：带解析重置时间的 body 对齐墙钟；无时间文案走有界退避，且
 	// **冷却中的重复触发不堆加**（旧「每次都翻倍」正是全池被推到 2h 封顶的元凶）。
 	// 跨冷却期的堆加语义由 pool 包 CooldownSoftRate 测试覆盖；此处锚定 handler 侧
-	// 的调用形态：连续 3 次软限流错误 → 首次 600s，后续不延长。
+	// 的调用形态，并覆盖 soft_rate_strikes 连续冻结门槛：
+	//   - 默认门槛 3：第 1、2 次不冻结（账号仍可选、面板不显示「冻结」）；
+	//   - 第 3 次达阈：落 600s 冷却，soft_streak 首次推进到 1；
+	//   - 冷却中的兜底探测（第 4、5 次）：不推进 streak、不延长 until。
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-	for i := 1; i <= 3; i++ {
+	for i := 1; i <= 2; i++ {
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
+		st, _ := p.Status("u1")
+		if st.Cooling {
+			t.Fatalf("call %d: 未达冻结门槛（默认 3）不应冷却: %+v", i, st)
+		}
+	}
+
+	// 第 3 次达阈：落 600s 冷却。
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("call 3: 达阈应进入 soft_rate 冷却: %+v", st)
+	}
+	if st.SoftStreak != 1 {
+		t.Errorf("call 3: soft_streak=%d want 1（达阈才推进退避指数）", st.SoftStreak)
+	}
+	if st.CoolRemaining < 600-3 || st.CoolRemaining > 600 {
+		t.Errorf("call 3: cool_remaining_sec=%d want ~600", st.CoolRemaining)
+	}
+
+	// 冷却中的兜底探测：不推进 streak、不延长 until。
+	for i := 4; i <= 5; i++ {
 		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i, st)
+			t.Fatalf("call %d: 应仍在 soft_rate 冷却: %+v", i, st)
 		}
 		if st.SoftStreak != 1 {
 			t.Errorf("call %d: 冷却中兜底探测不应推进 soft_streak, got %d", i, st.SoftStreak)
@@ -458,6 +487,7 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	)
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
+	p.SetSoftRateStrikes(1)                        // 门槛压到 1：本用例验证默认冷却时长，不验证门槛
 	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 SoftCooldown
 
 	rec := httptest.NewRecorder()
@@ -673,6 +703,8 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
 	// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
+	// 冻结门槛压到 1：本用例验证 6004 重置墙钟对齐，不验证门槛。
+	p.SetSoftRateStrikes(1)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
@@ -723,6 +755,7 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	)
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
+	p.SetSoftRateStrikes(1) // 门槛压到 1：本用例验证无重置文案的有界退避，不验证门槛
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",

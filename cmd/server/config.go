@@ -61,6 +61,11 @@ type Config struct {
 		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
 		SoftRateMax string `json:"soft_rate_max"` // "2h"
+		// SoftRateStrikes 连续软限流事件（429 / WAF 403 / 6004）达到该次数才真正
+		// 写入冷却，默认 3。1 = 恢复「一次 429 即冻结」旧行为。
+		// 目的：单次 429 常是上游瞬时频控（共享出口 IP 场景下多号同秒齐发），
+		// 一次即冻结会让健康账号被反复踢出池子、客户端秒失败。
+		SoftRateStrikes int `json:"soft_rate_strikes"` // 3
 	} `json:"cooldown"`
 
 	Schedule struct {
@@ -240,6 +245,7 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
+	c.Cooldown.SoftRateStrikes = 3
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
@@ -392,6 +398,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
 		c.Cooldown.SoftRateMax = v
 	}
+	if v := os.Getenv("WB2A_SOFT_RATE_STRIKES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.Cooldown.SoftRateStrikes = n
+		}
+	}
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
@@ -482,6 +493,10 @@ func (c *Config) normalize() error {
 	}
 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	// 冻结门槛缺省归一（非法/未设置回落默认 3，风格同 breaker_threshold）。
+	if c.Cooldown.SoftRateStrikes <= 0 {
+		c.Cooldown.SoftRateStrikes = 3
 	}
 	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown: %w", err)

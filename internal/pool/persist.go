@@ -159,6 +159,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			lastCheckinDay:           s.LastCheckinDay,
 			tokenUsage:               s.TokenUsage,
 			softStreak:               s.SoftStreak,
+			softRateFails:            s.SoftRateFails,
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
 		}
@@ -298,6 +299,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			LastCheckinDay:           e.lastCheckinDay,
 			TokenUsage:               e.tokenUsage,
 			SoftStreak:               e.softStreak,
+			SoftRateFails:            e.softRateFails,
 			SessionDeadFails:         e.sessionDeadFails,
 			ConsecutiveFails:         e.consecutiveFails,
 			CreditsExpiring:          e.creditsExpiring,

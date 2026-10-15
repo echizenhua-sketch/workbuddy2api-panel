@@ -25,6 +25,9 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// softRateStrikes 连续软限流事件达到该次数才真正写入冷却（SetSoftRateStrikes 注入；
+	// 默认 defaultSoftRateStrikes=3）。1 = 恢复旧行为（一次 429 即冻结）。
+	softRateStrikes int
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -144,6 +147,48 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	if d > 0 {
 		p.softRateMax = d
 	}
+}
+
+// SetSoftRateStrikes 注入连续软限流事件达到多少次才真正写入冷却（main 从 config
+// 解析后调用，默认 defaultSoftRateStrikes=3）。1 = 恢复「一次 429 即冻结」旧行为；
+// 0/负值保留现值（回落默认 3）。风格同 SetSoftRateMax。
+func (p *Pool) SetSoftRateStrikes(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n > 0 {
+		p.softRateStrikes = n
+	}
+}
+
+// softRateStrikesOr 返回生效的冻结门槛（未注入或非法时按默认 3），供冷却入口判定。
+// 调用方必须已持有 p.mu。
+func (p *Pool) softRateStrikesOr() int {
+	if p.softRateStrikes > 0 {
+		return p.softRateStrikes
+	}
+	return defaultSoftRateStrikes
+}
+
+// SoftRateStrikes 返回生效的冻结门槛（默认 3），供 /status、面板透出——
+// 面板据此把 accounts[].soft_rate_fails 渲染成「限流 2/3」。
+func (p *Pool) SoftRateStrikes() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.softRateStrikesOr()
+}
+
+// strikeSoftRateLocked 记录一次软限流事件（429 / WAF 403 / 6004）并判定是否达阈。
+// 返回 true = 已达门槛，调用方应当真正写入冷却；false = 仅计数，本次不冷却
+// （账号保持可选，面板不显示「冻结」）。达阈时计数清零，交给 softStreak 推进退避指数。
+// 调用方必须已持有 p.mu 写锁。
+func (p *Pool) strikeSoftRateLocked(e *entry) bool {
+	e.softRateFails++
+	if e.softRateFails < p.softRateStrikesOr() {
+		p.dirty.Store(true) // 计数需落盘（与 sessionDeadFails 同口径）
+		return false
+	}
+	e.softRateFails = 0
+	return true
 }
 
 // SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用，

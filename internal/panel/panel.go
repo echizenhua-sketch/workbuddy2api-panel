@@ -250,6 +250,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"paused":          paused,
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
+		// soft_rate_strikes 连续软限流冻结门槛（默认 3）：前端据此把
+		// accounts[].soft_rate_fails 渲染成「限流 2/3（连续达阈才冻结）」。
+		"soft_rate_strikes": p.cfg.Pool.SoftRateStrikes(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),

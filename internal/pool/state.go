@@ -87,6 +87,7 @@ func (p *Pool) Revive(uid string) bool {
 	e.coolKind = 0
 	e.reason = ""
 	e.softStreak = 0
+	e.softRateFails = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
 	e.fails = 0
@@ -164,6 +165,7 @@ func (p *Pool) NoteError(uid string) {
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
+// softRateFails（冻结门槛进度）同清——「连续」以成功为界，成功即证明限流已解除。
 // 同样清 sessionDeadFails 与连败降权计数（consecutiveFails/degradeUntil，issue #114）：
 // 成功证明账号当前可用，连败计数与临时出池截止一并归零。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
@@ -180,6 +182,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
+		e.softRateFails = 0
 		e.sessionDeadFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
@@ -566,6 +569,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastErrTime:              e.lastErr,
 		Until:                    e.until,
 		SoftStreak:               e.softStreak,
+		SoftRateFails:            e.softRateFails,
 		ModelCosts:               p.modelCostsStatusLocked(e, now),
 		ConsecutiveFails:         e.consecutiveFails,
 		DegradeUntil:             e.degradeUntil,
