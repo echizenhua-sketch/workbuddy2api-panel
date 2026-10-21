@@ -1262,6 +1262,7 @@ const AUTO_TASKS = {
   'create_canvas': '上报「设计创意画布创建」事件组（三账号实测点亮，+300 分）',
   'expert_5': '真实专家召唤+使用链 ×5（专家市场+真实 chat，三账号实测点亮）',
   'Expert_team_use_3': '真实专家团召唤+使用链 ×3（三账号实测点亮）',
+  'WorkBuddy_Valorant': '专家页搜索「无畏契约拼豆专家」→ 召唤链 + 真实对话（判据同 expert_actual_use）',
   'Hp_Appearance': '设置主题 API + 皮肤生效事件（两账号实测点亮）',
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',

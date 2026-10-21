@@ -16,7 +16,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/serve
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
-RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
+# APK_MIRROR：104 出口到 dl-cdn.alpinelinux.org 不通（IPv4 超时、IPv6 无路由，
+# apk 报 "Permission denied"）。默认保持上游 CDN，构建时可 --build-arg 换成
+# 内网可达镜像（实测 mirrors.aliyun.com 200/0.6s）。仅换下载源，包校验不变。
+ARG APK_MIRROR=dl-cdn.alpinelinux.org
+RUN if [ "$APK_MIRROR" != "dl-cdn.alpinelinux.org" ]; then \
+      sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories; \
+    fi \
+ && apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app

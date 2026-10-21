@@ -18,6 +18,17 @@
 // 仍未破解：skill_1（疑似要求真实 Skill 工具调用）。
 // 不做：Expert_lighthouse（需真实连接器授权）、Expert_Philanthropy（真实捐款）。
 //
+// wb_wechat_oa_subscribe_task（关注「腾讯 WorkBuddy」官方公众号满 24 小时）
+// **不做、也做不了**，已排除而非未实现（2026-10-21 核查）：
+//   - 达成条件是"微信侧真实关注并保持 24 小时"，进度由服务端按微信身份（unionid）
+//     计，客户端没有任何可上报的事件；
+//   - jump_url 指向 www.workbuddy.cn/events/follow-guide/，该页是纯静态二维码页，
+//     其构建产物 follow-guide-*.js 不含任何接口调用（已通读）；
+//   - 桌面协议已知事件码里没有关注公众号相关项；
+//   - 未完成账号直接 claim 返回上游 400 "task not completed"，服务端强校验进度。
+// 唯一可行路径是用真实微信关注该公众号并保持 24 小时（本账号池 15 个账号中已有
+// 1 个处于 claimed，证明可完成）。
+//
 // 所有动作幂等：已 claimed/已达标的任务直接跳过，不重复消耗上游配额。
 package panel
 
@@ -112,6 +123,11 @@ var autoActions = []autoAction{
 		TaskCode: "Expert_team_use_3",
 		Desc:     "真实专家团召唤+使用链 ×3（已验证：三账号点亮）",
 		run:      runExpertTeamUse,
+	},
+	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "专家页搜索「无畏契约拼豆专家」→ 召唤链 + 真实对话（判据同 expert_actual_use）",
+		run:      runValorantExpert,
 	},
 	{
 		TaskCode: "Hp_Appearance",
@@ -658,6 +674,24 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
 		return
 	}
+	// 未报名的任务先 accept：上游对 not_accepted 状态的账号**不计进度**——
+	// 2026-10-21 实测 4 个 not_accepted 账号跑完 expert_actual_use 链路后进度仍
+	// 0/1，补一次 accept 再重跑立即 1/1 并可领奖。accept 幂等（已 accepted 时
+	// 上游直接成功），失败不阻塞主流程（行为事件才是进度判据）。
+	if before.AcceptStatus != "accepted" && before.AcceptStatus != "completed" {
+		var aerr error
+		if isMP {
+			aerr = p.cfg.Upstream.AcceptTasksMP(a, []string{act.TaskCode})
+		} else {
+			aerr = p.cfg.Upstream.AcceptTasks(a, []string{act.TaskCode})
+		}
+		if aerr != nil {
+			log.Printf("autotask %s %s: 前置 accept 失败（继续执行动作）: %v",
+				logfmt.Label(a.UID, a.Nickname), act.TaskCode, aerr)
+		} else {
+			time.Sleep(reportGap)
+		}
+	}
 	msg, err := act.run(p, a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
@@ -1103,6 +1137,48 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 	}
 	_ = fail
 	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
+}
+
+// valorantExpertName WorkBuddy_Valorant 任务指定的专家名（任务文案口径）。
+const valorantExpertName = "无畏契约拼豆专家"
+
+// runValorantExpert 完成 WorkBuddy_Valorant（体验「无畏契约拼豆专家」）。
+//
+// 任务判据：在专家页搜索并召唤「无畏契约拼豆专家」，完成一次对话
+// （即 expert_actual_use 带该专家真实 expert_id + 服务端 requestId）。
+// 与 expert_5 同源，区别只在目标专家固定，且该专家 reco_rank 靠后
+// （20821 个专家里排 8361），必须走 keyword 检索而非榜单前 20。
+func runValorantExpert(p *Panel, a *auth.Auth) (string, error) {
+	experts, err := p.cfg.Upstream.MarketExpertSearch(a, "agent", valorantExpertName)
+	if err != nil {
+		return "", fmt.Errorf("搜索专家「%s」: %w", valorantExpertName, err)
+	}
+	var target *upstream.MarketExpert
+	for i := range experts {
+		if experts[i].DisplayNameZH == valorantExpertName {
+			target = &experts[i]
+			break
+		}
+	}
+	if target == nil {
+		return "", fmt.Errorf("专家市场未搜到「%s」（返回 %d 条）", valorantExpertName, len(experts))
+	}
+	// 召唤链（web_element_click + summon_click + summoned）。
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(*target)...); err != nil {
+		return "", fmt.Errorf("召唤链上报: %w", err)
+	}
+	// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, target.ExpertID)
+	if err != nil {
+		return "", fmt.Errorf("专家对话: %w", err)
+	}
+	// 使用事件（JOIN 服务端 requestId）+ chat 链。
+	events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(*target, conv, req))
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("使用事件上报: %w", err)
+	}
+	return fmt.Sprintf("已搜索并召唤「%s」（%s）完成一次对话", target.DisplayNameZH, target.ExpertID), nil
 }
 
 // ---------------------------------------------------------------------------
